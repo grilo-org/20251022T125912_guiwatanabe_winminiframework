@@ -1,0 +1,148 @@
+name: Grilo SC Analysis for .NET (Robust v7 - Final)
+
+on:
+  push:
+    branches: [ "master" ]
+  workflow_dispatch: {}
+
+jobs:
+  sonar-analysis:
+    name: SonarCloud Analysis
+    runs-on: ubuntu-latest
+
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PROJECT_BASE_KEY: "grilo-org_20251022T125912_guiwatanabe_winminiframework"
+
+    steps:
+      - name: 1. Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 2. Detect .NET Version
+        id: detect_net_version
+        run: |
+          echo "DEBUG: Iniciando detecção de versão do .NET..."
+          if [ -f "global.json" ]; then
+            echo "DEBUG: Encontrado global.json."
+            sdk_version_full=$(jq -r '.sdk.version' global.json | sed 's/[^0-9.]*//g')
+            if [ -n "$sdk_version_full" ]; then
+              sdk_version_major_minor=$(echo "$sdk_version_full" | cut -d'.' -f1,2)
+              echo "DEBUG: Versão completa detectada: $sdk_version_full. Usando versão para setup: $sdk_version_major_minor"
+              echo "dotnet_version=$sdk_version_major_minor" >> $GITHUB_OUTPUT
+            else
+              echo "WARN: global.json encontrado, mas não foi possível extrair a versão. Usando fallback."
+            fi
+          fi
+          
+          if ! grep -q "dotnet_version" "$GITHUB_OUTPUT" 2>/dev/null; then
+            echo "DEBUG: global.json não encontrado ou inválido. Procurando por TargetFramework."
+            target_framework=$(grep -ohr '<TargetFramework>net[0-9.]\+</TargetFramework>' . | sed -e 's/<[^>]*>//g' | sort -V | tail -n 1)
+            if [ -n "$target_framework" ]; then
+              sdk_version_from_tf=$(echo "$target_framework" | sed 's/net//')
+              echo "DEBUG: Maior TargetFramework detectado: $target_framework. Usando SDK versão $sdk_version_from_tf"
+              echo "dotnet_version=$sdk_version_from_tf" >> $GITHUB_OUTPUT
+            else
+              echo "WARN: Nenhuma versão do .NET pôde ser detectada. Usando 8.0 como padrão."
+              echo "dotnet_version=8.0" >> $GITHUB_OUTPUT
+            fi
+          fi
+        shell: bash
+
+      - name: 3. Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ steps.detect_net_version.outputs.dotnet_version }}
+
+      - name: 4. Install SonarScanner and Coverlet
+        run: |
+          echo "DEBUG: Instalando ferramentas..."
+          dotnet tool install --global dotnet-sonarscanner
+          dotnet tool install --global coverlet.console
+          echo "DEBUG: Ferramentas instaladas."
+
+      - name: 5. Find Solution File
+        id: find_solution
+        run: |
+          echo "DEBUG: Procurando por arquivo de solução (.sln)..."
+          solution_file=$(find . -name "*.sln" -not -path "./.git/*" -not -path "*/bin/*" -not -path "*/obj/*" | head -n 1)
+          if [ -n "$solution_file" ]; then
+            echo "DEBUG: Arquivo de solução encontrado: $solution_file"
+            echo "solution_path=$solution_file" >> $GITHUB_OUTPUT
+          else
+            echo "WARN: Nenhum arquivo de solução (.sln) encontrado."
+            echo "solution_path=''" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: 6. Begin SonarScanner Step
+        run: |
+          echo "DEBUG: Iniciando SonarScanner..."
+          dotnet sonarscanner begin /k:"${{ env.PROJECT_BASE_KEY }}" /o:"grilo-org" \
+            /d:sonar.host.url="https://sonarcloud.io" \
+            /d:sonar.login="${{ env.SONAR_TOKEN }}" \
+            /d:sonar.cs.cobertura.reportPaths="**/coverage.cobertura.xml" \
+            /d:sonar.verbose="true"
+        shell: bash
+
+      - name: 7. Build and Run Tests
+        run: |
+          echo "DEBUG: Executando build e testes..."
+          if [ -n "${{ steps.find_solution.outputs.solution_path }}" ]; then
+            dotnet build "${{ steps.find_solution.outputs.solution_path }}" --no-incremental
+            dotnet test "${{ steps.find_solution.outputs.solution_path }}" --no-build --collect:"XPlat Code Coverage" --logger "console;verbosity=detailed"
+          else
+            dotnet build --no-incremental
+            dotnet test --no-build --collect:"XPlat Code Coverage" --logger "console;verbosity=detailed"
+          fi
+        shell: bash
+
+      - name: 8. End SonarScanner Step
+        run: |
+          echo "DEBUG: Finalizando análise do SonarScanner..."
+          dotnet sonarscanner end /d:sonar.login="${{ env.SONAR_TOKEN }}" | tee sonar_end_output.log
+        shell: bash
+
+      - name: 9. Verify SonarCloud Analysis Results
+        run: |
+          echo "DEBUG: Verificando resultados da análise no SonarCloud..."
+          # CORREÇÃO: Adiciona a flag -a (ou --text ) para forçar o grep a tratar o arquivo como texto.
+          TASK_ID=$(grep -a -o 'ce/task?id=[^&[:space:]]*' sonar_end_output.log | cut -d'=' -f2)
+          if [ -z "$TASK_ID" ]; then
+            echo "ERRO: Não foi possível encontrar o ID da tarefa de análise do SonarCloud no log de saída."
+            exit 1
+          fi
+          
+          echo "DEBUG: ID da tarefa do SonarCloud: $TASK_ID"
+          TASK_URL="https://sonarcloud.io/api/ce/task?id=$TASK_ID"
+          
+          echo "DEBUG: Aguardando o processamento da tarefa no SonarCloud..."
+          for i in {1..30}; do
+            status=$(curl -s -u "${{ env.SONAR_TOKEN }}:" "$TASK_URL" | jq -r .task.status )
+            echo "DEBUG: Status atual da tarefa: $status (tentativa $i/30)"
+            if [ "$status" == "SUCCESS" ]; then
+              break
+            elif [ "$status" == "FAILED" ] || [ "$status" == "CANCELED" ]; then
+              echo "ERRO: A tarefa de análise do SonarCloud falhou no servidor. Status: $status"
+              exit 1
+            fi
+            sleep 10
+          done
+          
+          ANALYSIS_ID=$(curl -s -u "${{ env.SONAR_TOKEN }}:" "$TASK_URL" | jq -r .task.analysisId)
+          echo "DEBUG: ID da análise: $ANALYSIS_ID"
+          
+          METRICS_URL="https://sonarcloud.io/api/measures/component?component=${{ env.PROJECT_BASE_KEY }}&metricKeys=ncloc"
+          NCLOC=$(curl -s -u "${{ env.SONAR_TOKEN }}:" "$METRICS_URL" | jq -r '.component.measures[] | select(.metric=="ncloc" ) | .value')
+          
+          echo "INFO: Linhas de código (ncloc) detectadas: $NCLOC"
+          
+          if [ -z "$NCLOC" ] || [ "$NCLOC" -le 0 ]; then
+            echo "ERRO: A análise do SonarCloud foi concluída, mas não detectou nenhuma linha de código."
+            exit 1
+          else
+            echo "SUCESSO: A análise do SonarCloud foi verificada e contém $NCLOC linhas de código."
+          fi
+        shell: bash
